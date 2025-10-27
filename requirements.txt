@@ -1,0 +1,12 @@
+# requirements.txt for LoL AutoPick Helper
+
+# 核心依赖：用于网络请求、图像处理、进程信息和进度条显示
+requests
+Pillow
+psutil
+tqdm
+
+# 注意：
+# 1. tkinter 是 Python 标准库的一部分，通常无需单独安装，因此没有包含。
+# 2. urllib3, os, json, re, threading, time, sys 都是 Python 标准库，无需包含。
+# 3. HTTPBasicAuth 是 requests.auth 的一部分，requests 库包含它。
