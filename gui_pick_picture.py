@@ -8,7 +8,8 @@ from requests.auth import HTTPBasicAuth
 import sys
 from tqdm import tqdm
 import logging
-
+import pystray
+from PIL import Image, ImageDraw
 
 logging.basicConfig(level=logging.INFO, 
                    format='%(asctime)s - %(levelname)s - %(message)s',
@@ -932,6 +933,97 @@ restart_lcu_button.pack(pady=(15, 10), padx=50, fill='x')
 status_label = tk.Label(root, textvariable=status_var,
     font=("Microsoft YaHei", 10, "bold"), bg="#f2f2f2", fg="#333")
 status_label.pack(pady=(0, 10))
+
+
+
+
+
+
+
+tray_icon = None
+
+def quit_window(icon, item):
+    """托盘菜单 - 退出程序"""
+    global tray_icon
+    icon.stop()
+    # 彻底关闭主窗口和应用程序
+    # 使用 root.quit() 和 root.destroy() 确保 Tkinter 进程干净退出
+    root.quit() 
+    root.destroy()
+    # sys.exit() 是为了确保如果 Tkinter 主循环已经退出，整个 Python 进程也能结束
+    sys.exit() 
+
+def show_window(icon, item):
+    """托盘菜单 - 恢复主窗口"""
+    global tray_icon
+    
+    # 1. 停止托盘图标
+    icon.stop()
+    
+    # 2. 恢复主窗口
+    root.deiconify() 
+    
+    # ⭐️ 关键修复：确保窗口被置于顶层并获得焦点
+    # root.lift()：将窗口移动到堆叠顺序的顶部 (Z-order)
+    root.lift() 
+    
+    # root.focus_force()：强制窗口获取输入焦点
+    root.focus_force() 
+    
+    # root.attributes('-topmost', True)：这是一个额外的保险，短暂置顶，
+    # 确保它出现在最前面，然后立即取消，以防止干扰正常窗口行为。
+    root.attributes('-topmost', True)
+    root.after_idle(root.attributes, '-topmost', False) 
+    
+    # 3. 确保它不再处于最小化/被隐藏的状态（这通常是 deiconify() 做的，但重复执行无害）
+    # root.state('normal')
+
+def withdraw_window():
+    """窗口关闭按钮 (X) - 隐藏到托盘"""
+    global tray_icon
+    
+    # 1. 隐藏主窗口
+    root.withdraw()
+    
+    # 2. 加载图标
+    image = None
+    try:
+        # ⭐️ 使用全局定义的 icon_path 变量加载图像
+        # pystray 运行良好，通常不需要 .resize，但如果 ICO 包含多尺寸，PIL 会自动选择。
+        image = Image.open(icon_path)
+    except Exception as e:
+        # 如果加载图标文件失败，创建一个默认的占位符图标
+        logging.error(f"❌ 无法加载托盘图标 {icon_path}，使用默认占位符。错误: {e}")
+        image = Image.new('RGB', (64, 64), 'white')
+        d = ImageDraw.Draw(image)
+        d.ellipse((10, 10, 54, 54), fill='#0078D7') # 绘制一个蓝色圆圈
+    
+    # 3. 定义托盘菜单
+    menu = (
+        pystray.MenuItem('显示窗口', show_window, default=True),
+        pystray.MenuItem('退出程序', quit_window)
+    )
+    
+    # 4. 创建并运行托盘图标
+    tray_icon = pystray.Icon(
+        name="AutoPick", 
+        icon=image, # 传入 PIL Image 对象
+        title="AutoPick Created by God", 
+        menu=menu
+    )
+    
+    # 启动托盘图标（它会自动在一个单独的线程中运行）
+    tray_icon.run()
+
+
+# 6. 当前状态标签
+status_label = tk.Label(root, textvariable=status_var,
+    font=("Microsoft YaHei", 10, "bold"), bg="#f2f2f2", fg="#333")
+status_label.pack(pady=(0, 10))
+
+# --- 绑定窗口关闭事件 ---
+# 绑定窗口关闭事件 (右上角 X) 到自定义的 withdraw_window 函数
+root.protocol("WM_DELETE_WINDOW", withdraw_window)
 
 # 线程启动
 threading.Thread(target=monitor_game_state, daemon=True).start()
