@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO,
 # ----------------------------------------------------
 # 英雄 ID 常量
 DEFAULT_CHAMPION_ID = 157 # 默认英雄 (亚索)
-DEFAULT_BAN_CHAMPION_ID = 484 # 默认禁用英雄 (俄洛伊)
+DEFAULT_BAN_CHAMPION_ID = 800 # 默认禁用英雄 (俄洛伊)
 DEFAULT_CHAMPION_NAME = "" # 动态确定 (秒选/预选默认名)
 DEFAULT_BAN_NAME = "" # 动态确定 (禁用默认名)
 
@@ -143,6 +143,8 @@ class LoLHelper:
 
     def _request(self, method, endpoint, data=None):
         url = f"{self.base_url}{endpoint}"
+        response = None  # ⭐️ 关键修复：在 try 块外部初始化 response
+        
         try:
             if method == "GET":
                 response = self.session.get(url, auth=self.auth)
@@ -152,22 +154,31 @@ class LoLHelper:
                 response = self.session.patch(url, json=data, auth=self.auth)
             else:
                 raise ValueError(f"不支持的请求方法: {method}")
+
+            # ⭐️ 保留您正确的 404 处理逻辑 (上次的修复)
+            if response.status_code == 404:
+                if endpoint.startswith("/lol-gameflow") and response.json().get("errorCode") == "RPC_ERROR":
+                    # 正常的大厅状态，返回特殊字典，不抛异常
+                    return {"phase": "None"} 
+
+            response.raise_for_status() # 抛出非 404 的 HTTPError 异常
             
-            response.raise_for_status() # 抛出 HTTPError 异常
-            
-            # 尝试返回 JSON，如果响应体为空则返回 None
+            # 尝试返回 JSON
             return response.json() if response.content else None
 
         except requests.exceptions.RequestException as e:
             # 区分连接错误和 API 错误
             if isinstance(e, requests.exceptions.ConnectionError):
                 logging.error(f"LCU 连接失败: {url} -> {e}")
-            elif hasattr(e, 'response'):
-                logging.error(f"LCU API 错误: {e.response.status_code} on {url} -> {e.response.text}")
+            elif response is not None and hasattr(e, 'response'):
+                logging.error(f"LCU API 错误: {response.status_code} on {url} -> {response.text}")
             else:
-                logging.error(f"LCU 请求发生未知错误: {e}")
+                # ⭐️ 修复后的这里：response is None 表示请求本身失败（如 DNS 错误, 超时，或前面提到的 NameError）
+                logging.error(f"LCU 请求发生未知或网络错误: {e}")
             return None
+            
         except Exception as e:
+            # 捕获其他非请求异常（如 response.json() 解析失败）
             logging.error(f"请求过程中发生异常: {e}")
             return None
 
@@ -187,13 +198,36 @@ class LoLHelper:
         logging.info("发送 LCU UI 重启请求...")
         result = self.post(path)
         return result is not None or True # 重启请求通常成功返回 None 或 204
-
+    
+    def lobby_play_again(self):
+        # 1. 尝试跳过结算等待/动画
+        logging.info("➡️ 尝试跳过结算等待/动画...")
+        try:
+            # 这个端点用于从等待结算页面过渡到最终结算页，可能需要或不需要
+            self.post("lol-end-of-game/v1/state", {}) 
+        except Exception as e:
+            # 跳过失败是常见情况，可以忽略
+            logging.warning(f"跳过结算 API 调用失败: {e}") 
+        
+        # 2. 点击“再来一局”
+        try:
+            logging.info("🔄 尝试调用 /lol-lobby/v2/play-again (再来一局)...")
+            # ⭐️ 关键修复：使用正确的 /v2 端点
+            # 确保您的 post 方法调用的是 /lol-lobby/v2/play-again (而不是 /lol-lobby/v1/lobby/play-again)
+            response = self.post("lol-lobby/v2/play-again", {}) 
+            logging.info("✅ '再来一局' API 调用成功。")
+            return response
+        except Exception as e:
+            # 如果 LCU 不在 Lobby 界面，可能会返回 404/409/400 错误，这是正常的，不影响程序继续运行
+            logging.error(f"❌ '再来一局' API 调用失败 (可能是客户端不在正确状态): {e}")
+            return None
+        
     # ----------------------------------------------------
     # 新增：跳过结算页面，回到大厅
     # ----------------------------------------------------
     def lobby_play_again(self) -> bool:
         """发送 POST 请求跳过结算页面，回到大厅。"""
-        path = "/lol-lobby/v1/lobby/play-again"
+        path = "lol-lobby/v2/play-again"
         logging.info("发送 'Play Again' 请求...")
         # LCU 接口通常不要求 body
         result = self.post(path) 
@@ -373,88 +407,111 @@ def load_local_avatars(champion_keys, folder="avatars"):
 
 
 
+import time
+import threading
+import logging
+# 假设 requests.exceptions 已经从 requests 库导入
+import requests.exceptions 
+# 假设 LoLHelper, get_lcu_credentials, 以及所有全局变量已在其他地方定义
+
 def monitor_game_state():
     global lcu, AUTO_PICK_ID, AUTO_INTENT_ID, AUTO_BAN_ID, has_picked, has_banned
     global auto_pick_var, auto_ban_var, status_var, auto_accept_var, auto_play_again_var
     
     BAN_TIME_THRESHOLD = 3.0 
-    
-    # LCU 连接检查 (保持不变)
-    if lcu is None or isinstance(lcu, MockLCU):
-        port, token = get_lcu_credentials()
-        if port and token:
-            lcu = LoLHelper(port, token)
-        elif status_var:
-            status_var.set("状态获取失败或 LCU 未运行")
-        if lcu is None or isinstance(lcu, MockLCU):
-            threading.Timer(5.0, monitor_game_state).start() 
-            return
+    RETRY_INTERVAL = 5.0 # LCU 断开时的重试间隔
 
     if auto_pick_var is None or auto_ban_var is None or status_var is None: 
-        time.sleep(0.1)
+        # 等待 UI 变量初始化
+        threading.Timer(0.5, monitor_game_state).start()
         return
-    
+
+    # 核心循环
     while True:
+        # ----------------------------------------------------
+        # 阶段 1: LCU 连接检查 (在循环开始时执行)
+        # ----------------------------------------------------
+        if lcu is None or not isinstance(lcu, LoLHelper):
+            # 尝试重新获取凭证
+            port, token = get_lcu_credentials()
+            
+            if port and token:
+                logging.info("🌟 成功找到 LCU 凭证，初始化 LoLHelper。")
+                lcu = LoLHelper(port, token)
+            else:
+                if status_var:
+                    # 明确表示找不到 LCU 进程，等待重试
+                    status_var.set("🔴 LCU 离线/未运行，5秒后重试...") 
+                    
+                logging.warning("LCU 未连接，等待中...")
+                time.sleep(RETRY_INTERVAL)
+                continue # 重试连接
+
+        # ----------------------------------------------------
+        # 阶段 2: 状态监控和自动操作
+        # ----------------------------------------------------
         try:
+            # 尝试获取 LCU 状态
             state = lcu.get("lol-gameflow/v1/session")
+            
+            # 关键修复：如果 LCU API 调用返回 None，视为连接已断开，抛出 ConnectionError
+            if state is None:
+                # 这将强制进入下面的 except requests.exceptions.ConnectionError 块
+                raise requests.exceptions.ConnectionError("LCU API 返回 None，可能连接中断。") 
+                
             phase = state.get("phase", "None")
 
             # 非选人阶段，重置状态
             if phase != "ChampSelect":
                 has_picked = False
                 has_banned = False 
-
+                
+            # 状态文本更新 (正常状态)
             status_text_base = {
                 "None": "未在房间", "Lobby": "正在房间 - 未排队",
                 "Matchmaking": "正在房间 - 排队中", "ReadyCheck": "正在房间 - 接受中",
                 "ChampSelect": "正在房间 - 选英雄", "InProgress": "游戏中",
                 "WaitingForStats": "等待结算页面", "EndOfGame": "结算页面",
             }.get(phase, phase)
-
             status_var.set(f"当前状态：{status_text_base}")
-
+            
             # 1. 自动接受匹配 Check 
-            if auto_accept_var.get():
-                if phase == "ReadyCheck":
-                    time.sleep(0.05) 
-                    match_state = lcu.get("lol-matchmaking/v1/ready-check")
-                    if match_state and match_state.get("state") == "InProgress":
-                        logging.info("🎮 检测到匹配成功，正在接受对局...")
-                        lcu.post("lol-matchmaking/v1/ready-check/accept", {})
-                        time.sleep(0.1)
+            if auto_accept_var.get() and phase == "ReadyCheck":
+                match_state = lcu.get("lol-matchmaking/v1/ready-check")
+                if match_state and match_state.get("state") == "InProgress":
+                     logging.info("🎮 检测到匹配成功，正在接受对局...")
+                     lcu.post("lol-matchmaking/v1/ready-check/accept", {})
 
-            # 3. 自动再来一局 (保持不变)
-            if auto_play_again_var.get() and phase in ("WaitingForStats", "EndOfGame"):
+            # 3. 自动再来一局
+            if auto_play_again_var.get() and phase in ("WaitingForStats", "EndOfGame", "PreEndOfGame"):
                  logging.info(f"⏭️ 检测到阶段: {phase}，尝试发送 'Play Again' 请求。")
                  lcu.lobby_play_again()
-                 time.sleep(0.1) 
 
             # 4. 核心：处理 ChampSelect 阶段的 Ban, Intent, Pick
             if phase == "ChampSelect":
                 try:
                     session = lcu.get("lol-champ-select/v1/session")
-                    cell_id = session["localPlayerCellId"]
+                    if session is None: raise Exception("无法获取选人会话")
                     
+                    cell_id = session["localPlayerCellId"]
                     timer_data = session.get("timer", {})
                     current_champ_select_phase = timer_data.get("phase", "UNKNOWN")
                     time_remaining = timer_data.get("timeLeftInPhase", 0) / 1000.0 
                     
-                    # ⭐️ 调试点 1：打印 LCU 原始计时器数据
-                    logging.debug(f"LCU Timer Raw Data: {timer_data}")
-                    
+                    # 子阶段文本更新
                     sub_phase_text = {
                         "PLANNING": "预选/禁选", "BAN_PICK": "禁用/选择",
                         "PRE_BAN": "禁选 ", "BAN": "禁用中 ",
                         "PRE_PICK": "预选 ", "PICK": "选择中 ",
                         "FINAL_BANS": "最终禁用", "FINALIZATION": "选人结束/等待中",
+                        "PreEndOfGame": "结算前等待/跳过结算",
                         "CLOSING": "选人结束"
                     }.get(current_champ_select_phase, "选英雄中...")
-
                     status_var.set(f"当前状态：{status_text_base} ({sub_phase_text}) ")
                     
-                    should_exit_outer_loop = False
+                    should_exit_outer_loop = False # 用于跳出双层循环
                     
-                    # 1. 预选英雄 (Intent) 逻辑 (保持不变)
+                    # 1. 预选英雄 (Intent) 逻辑
                     if auto_pick_var.get() and AUTO_PICK_ID and current_champ_select_phase in ("PLANNING", "PRE_BAN", "PRE_PICK"):
                         for group in session["actions"]:
                             for action in group:
@@ -471,11 +528,9 @@ def monitor_game_state():
                                     )
                                     break 
 
-                    # 2. 遍历动作组，执行 Ban 和 Lock 
+                    # 2. 遍历动作组，执行 Ban 和 Lock
                     for group_index, group in enumerate(session["actions"]):
-                        if should_exit_outer_loop:
-                            break 
-
+                        if should_exit_outer_loop: break 
                         for action in group:
                             action_id = action["id"]
                             action_type = action["type"]
@@ -483,15 +538,9 @@ def monitor_game_state():
                             completed = action["completed"]
                             is_active = action.get("isInProgress", False) 
 
-                            # 只处理当前玩家、未完成且正在进行中的动作
-                            if actor_cell_id != cell_id or completed or not is_active:
-                                continue
-
-                            # ⭐️ 调试点 2：打印激活动作的完整数据
-                            logging.debug(f"Active Action Found: ID={action_id}, Type={action_type}, Action Data={action}")
-
-
-                            # 优先级 A: Pick/Lock (秒选英雄) 
+                            if actor_cell_id != cell_id or completed or not is_active: continue
+                            
+                            # A: Pick/Lock
                             if action_type == "pick" and auto_pick_var.get() and AUTO_PICK_ID and not has_picked:
                                 if current_champ_select_phase in ("PICK", "BAN_PICK"): 
                                     logging.info(f"✅ LOCK PATCH 自动秒选英雄 ID: {AUTO_PICK_ID}")
@@ -503,16 +552,10 @@ def monitor_game_state():
                                     should_exit_outer_loop = True
                                     break 
 
-                            # 优先级 B: Ban (禁用英雄)
+                            # B: Ban
                             elif action_type == "ban" and auto_ban_var.get() and AUTO_BAN_ID and not has_banned:
-                                
-                                # 1. 严格限制阶段：只在实际的 BAN 或 BAN_PICK 阶段执行最终禁用
                                 if current_champ_select_phase in ("BAN", "BAN_PICK"):
-                                    
-                                    # 2. 重新启用计时器判断（晚禁用/秒禁都可以）
-                                    # BAN_TIME_THRESHOLD = 3.0s (或者您想要的秒禁时间)
                                     if time_remaining <= BAN_TIME_THRESHOLD:
-                                        
                                         try:
                                             logging.info(f"✅ BAN PATCH 自动禁用英雄 ID: {AUTO_BAN_ID} (倒计时: {time_remaining:.1f}s)")
                                             lcu.patch(
@@ -521,39 +564,46 @@ def monitor_game_state():
                                             )
                                             has_banned = True 
                                         except Exception as patch_e:
-                                            # 失败也标记已尝试，防止下一轮重复发送
                                             logging.error(f"❌ BAN PATCH 失败: {patch_e}")
-                                            has_banned = True 
+                                            has_banned = True # 标记为已尝试，避免重复失败
                                             
                                         should_exit_outer_loop = True
-                                        break # 退出 inner loop
-                                
-                                # 3. 如果当前是 PLANNING 阶段，我们只进行预选意图（如果需要）
-                                elif current_champ_select_phase in ("PLANNING", "PRE_BAN"):
-                                    # LCU的Ban动作在PLANNING阶段可能是预禁选动作，
-                                    # 但通常预禁选使用的是Pick动作类型，这里可以忽略或根据需求处理预禁选意图
-                                    # 假设您只需要在正式阶段Ban英雄，这里不做任何操作，让它跳过。
-                                    pass 
-
-                        if should_exit_outer_loop:
-                            break 
+                                        break 
 
                 except Exception as e:
-                    logging.error(f"❌ 自动操作异常：{e}")
+                    logging.error(f"❌ 自动操作异常（选人阶段）：{e}")
+                    pass # 忽略选人阶段的暂时异常，继续监控
 
-        except Exception as e:
-            # LCU 连接失败或 session 错误
-            logging.error(f"❌ 主循环 LCU/状态获取异常: {e}")
-            if status_var:
-                status_var.set("状态获取失败或 LCU 未运行")
+        # ----------------------------------------------------
+        # 阶段 3: 异常处理 (LCU 断开)
+        # ----------------------------------------------------
+        except requests.exceptions.ConnectionError as e:
+            # 这只会在真正的网络连接断开时触发 (包括 WinError 10061 错误)
             
-            port, token = get_lcu_credentials()
-            if port and token:
-                lcu = LoLHelper(port, token)
-            else:
-                lcu = MockLCU() 
+            # ⭐️ 关键修复：确保状态更新逻辑执行，且缩进正确
+            if status_var:
+                status_var.set("🔴 LCU 离线/连接中断，正在尝试重新连接...")
+        
+            logging.error(f"❌ 主循环 LCU 连接完全中断: {e}")
+            
+            # 清除 LCU 实例，迫使下一轮循环重新获取凭证
+            lcu = None 
+            has_picked = False
+            has_banned = False
+            time.sleep(RETRY_INTERVAL)
+            continue
+            
+        except Exception as e:
+            # 捕获其他非连接相关的异常 (如 session 内部 JSON 结构变化)
+            logging.error(f"❌ 主循环 LCU/状态获取发生非连接异常: {e}")
+            # 遇到其他异常时不立即断开 LCU，只休眠，给它机会恢复
+            time.sleep(1.0) # 较短的休眠
+            continue 
 
-        time.sleep(0.1)
+        # ----------------------------------------------------
+        # 阶段 4: 循环延迟 (如果一切正常)
+        # ----------------------------------------------------
+        time.sleep(0.1) # 正常轮询间隔
 # ... (ImageDropdown 类保持不变)
 
 class ImageDropdown(tk.Frame):
