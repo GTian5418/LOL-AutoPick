@@ -5,6 +5,7 @@ requests
 Pillow
 psutil
 tqdm
+pystray
 
 # 注意：
 # 1. tkinter 是 Python 标准库的一部分，通常无需单独安装，因此没有包含。

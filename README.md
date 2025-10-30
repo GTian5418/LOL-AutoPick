@@ -20,7 +20,7 @@
 使用 PyInstaller 打包为无控制台的 `.exe` 程序：
 
 ```bash
-pyinstaller --onefile --windowed --icon=app_icon.ico --add-data "avatars;avatars"  --add-data "champion.json;." --add-data "app_icon.ico;." gui_pick_picture.py    
+pyinstaller --onefile --windowed --icon=app_icon.ico --name LOL-AutoPick --add-data "avatars;avatars"  --add-data "champion.json;." --add-data "app_icon.ico;." gui_pick_picture.py    
 ```
 
 ## 🧑‍💻 技术栈 Technology Stack
