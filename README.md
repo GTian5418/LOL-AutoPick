@@ -56,4 +56,4 @@ python gui_pick_picture.py
 ## 🤝 贡献与感谢
 如果你喜欢这个小工具，欢迎 Star/Fork/提出 Pull Request！你的赞对我来说就是最大的动力！💕
 
-[GitHub Project Link]
+[GitHub Project Link](https://github.com/GTian5418/LOL-AutoPick)
